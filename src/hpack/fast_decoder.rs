@@ -40,12 +40,19 @@ impl WriteArena {
         }
     }
 
-    /// Append raw bytes. Returns (offset, len).
+    /// Append raw bytes. Returns (offset, len), or error if len > u16::MAX or
+    /// if the current buffer offset would overflow u32.
     #[inline]
-    fn write(&mut self, data: &[u8]) -> (u32, u16) {
-        let offset = self.buf.len() as u32;
+    fn write(&mut self, data: &[u8]) -> Result<(u32, u16), DecoderError> {
+        if data.len() > u16::MAX as usize {
+            return Err(DecoderError::IntegerOverflow);
+        }
+        let offset = self.buf.len();
+        if offset > u32::MAX as usize {
+            return Err(DecoderError::IntegerOverflow);
+        }
         self.buf.extend_from_slice(data);
-        (offset, data.len() as u16)
+        Ok((offset as u32, data.len() as u16))
     }
 
     /// Reserve space for Huffman output, returning start offset and mutable slice.
@@ -182,6 +189,9 @@ impl DynTable {
     }
 
     fn insert_raw(&mut self, name: &[u8], value: &[u8]) {
+        if name.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
+            return;
+        }
         let entry_size = name.len() + value.len() + 32;
         self.reserve(entry_size);
         if self.size + entry_size > self.max_size {
@@ -212,19 +222,19 @@ impl DynTable {
     }
 
     /// Copy a dynamic table entry's name and value into the arena.
-    fn copy_to_arena(&self, entry: &DynEntry, arena: &mut WriteArena) -> DecodedHeader {
+    fn copy_to_arena(&self, entry: &DynEntry, arena: &mut WriteArena) -> Result<DecodedHeader, DecoderError> {
         let name = &self.storage
             [entry.name_start as usize..entry.name_start as usize + entry.name_len as usize];
         let value = &self.storage
             [entry.value_start as usize..entry.value_start as usize + entry.value_len as usize];
-        let (name_offset, name_len) = arena.write(name);
-        let (value_offset, value_len) = arena.write(value);
-        DecodedHeader::Arena {
+        let (name_offset, name_len) = arena.write(name)?;
+        let (value_offset, value_len) = arena.write(value)?;
+        Ok(DecodedHeader::Arena {
             name_offset,
             name_len,
             value_offset,
             value_len,
-        }
+        })
     }
 
     fn name_slice(&self, entry: &DynEntry) -> &[u8] {
@@ -239,6 +249,7 @@ impl DynTable {
                 None => return,
             }
         }
+        self.compact_storage();
     }
 
     fn set_max_size(&mut self, size: usize) {
@@ -248,6 +259,29 @@ impl DynTable {
                 Some(last) => self.size -= last.entry_size,
                 None => panic!("Size of table != 0, but no headers left!"),
             }
+        }
+        self.compact_storage();
+    }
+
+    /// Shift surviving entries to the front of storage, freeing the evicted prefix.
+    /// Updates all DynEntry offsets so they remain valid after the shift.
+    fn compact_storage(&mut self) {
+        if self.entries.is_empty() {
+            self.storage_pos = 0;
+            return;
+        }
+        // The oldest (back) entry holds the lowest offsets — that is the start
+        // of still-live data in storage.
+        let base = self.entries.back().unwrap().name_start as usize;
+        if base == 0 {
+            return;
+        }
+        self.storage.copy_within(base..self.storage_pos, 0);
+        self.storage_pos -= base;
+        let base32 = base as u32;
+        for entry in &mut self.entries {
+            entry.name_start -= base32;
+            entry.value_start -= base32;
         }
     }
 
@@ -378,6 +412,9 @@ fn huffman_decode_to_arena(
     let (start_offset, start_idx) = arena.reserve_mut(max_out);
     let actual_len = huffman::decode_to_slice(src, &mut arena.as_mut_slice()[start_idx..])?;
     arena.truncate_to(start_idx + actual_len);
+    if actual_len > u16::MAX as usize {
+        return Err(DecoderError::IntegerOverflow);
+    }
     Ok((start_offset, actual_len as u16))
 }
 
@@ -496,7 +533,7 @@ fn materialize_static_name(idx: u8, value: Bytes) -> Result<Header, DecoderError
 #[inline]
 fn materialize_field(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
     if name.is_empty() {
-        return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
+        return Err(DecoderError::InvalidRepresentation);
     }
     if name[0] == b':' {
         // Pseudo-header from dynamic table — use safe construction
@@ -622,7 +659,10 @@ fn match_known_header(name: &[u8]) -> Option<HeaderName> {
 /// Known header names bypass `HeaderName::from_lowercase()`.
 /// Header values skip per-byte validation via `from_maybe_shared_unchecked`.
 pub struct FastDecoder {
-    max_size_update: Option<usize>,
+    /// Smallest size seen across all pending SETTINGS updates (must shrink to this first).
+    pending_min_update: Option<usize>,
+    /// Final size from the last pending SETTINGS update.
+    pending_final_update: Option<usize>,
     last_max_update: usize,
     dyn_table: DynTable,
     /// Reusable decoded header output vec
@@ -632,7 +672,8 @@ pub struct FastDecoder {
 impl FastDecoder {
     pub fn new(size: usize) -> Self {
         FastDecoder {
-            max_size_update: None,
+            pending_min_update: None,
+            pending_final_update: None,
             last_max_update: size,
             dyn_table: DynTable::new(size),
             decoded_headers: Vec::with_capacity(32),
@@ -641,11 +682,13 @@ impl FastDecoder {
 
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
-        let size = match self.max_size_update {
-            Some(v) => std::cmp::max(v, size),
+        // Track both the minimum (required shrink) and the final value across
+        // all SETTINGS updates received before the next HEADERS block.
+        self.pending_min_update = Some(match self.pending_min_update {
+            Some(existing) => existing.min(size),
             None => size,
-        };
-        self.max_size_update = Some(size);
+        });
+        self.pending_final_update = Some(size);
     }
 
     pub fn decode<F>(
@@ -658,8 +701,13 @@ impl FastDecoder {
     {
         let mut can_resize = true;
 
-        if let Some(size) = self.max_size_update.take() {
-            self.last_max_update = size;
+        // Apply the minimum shrink first (evict entries that no longer fit),
+        // then record the final size as the ceiling for encoder size-update signals.
+        if let Some(min_size) = self.pending_min_update.take() {
+            self.dyn_table.set_max_size(min_size);
+        }
+        if let Some(final_size) = self.pending_final_update.take() {
+            self.last_max_update = final_size;
         }
 
         let data = &src.chunk()[..src.remaining()];
@@ -737,7 +785,7 @@ impl FastDecoder {
         match self.dyn_table.get(dyn_idx) {
             Some(entry) => {
                 let entry = *entry;
-                Ok(self.dyn_table.copy_to_arena(&entry, arena))
+                self.dyn_table.copy_to_arena(&entry, arena)
             }
             None => Err(DecoderError::InvalidTableIndex),
         }
@@ -766,7 +814,7 @@ impl FastDecoder {
             match self.dyn_table.get(dyn_idx) {
                 Some(entry) => {
                     let name = self.dyn_table.name_slice(entry);
-                    let (offset, len) = arena.write(name);
+                    let (offset, len) = arena.write(name)?;
                     NameSource::Arena { offset, len }
                 }
                 None => return Err(DecoderError::InvalidTableIndex),
@@ -826,7 +874,7 @@ impl FastDecoder {
         if huff {
             huffman_decode_to_arena(raw, arena)
         } else {
-            Ok(arena.write(raw))
+            arena.write(raw)
         }
     }
 }

@@ -109,6 +109,9 @@ impl Decoder {
             return Err(DecoderError::InvalidHuffmanCode);
         }
         if flags1 & DECODED != 0 {
+            if dst_pos >= dst.len() {
+                return Err(DecoderError::InvalidHuffmanCode);
+            }
             dst[dst_pos] = byte1;
             dst_pos += 1;
         }
@@ -119,6 +122,9 @@ impl Decoder {
             return Err(DecoderError::InvalidHuffmanCode);
         }
         if flags2 & DECODED != 0 {
+            if dst_pos >= dst.len() {
+                return Err(DecoderError::InvalidHuffmanCode);
+            }
             dst[dst_pos] = byte2;
             dst_pos += 1;
         }
@@ -141,6 +147,10 @@ impl Decoder {
 /// This avoids all BytesMut overhead: no reserve, no split, no freeze.
 #[cfg(feature = "fast-hpack")]
 pub fn decode_to_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, DecoderError> {
+    debug_assert!(
+        dst.len() >= src.len() * 2,
+        "dst must be at least src.len()*2 bytes for Huffman decode"
+    );
     let mut decoder = Decoder::new();
     let mut pos = 0;
 
