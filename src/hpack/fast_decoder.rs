@@ -56,11 +56,15 @@ impl WriteArena {
     }
 
     /// Reserve space for Huffman output, returning start offset and mutable slice.
+    /// Returns an error if the current buffer length would overflow u32.
     #[inline]
-    fn reserve_mut(&mut self, max_len: usize) -> (u32, usize) {
+    fn reserve_mut(&mut self, max_len: usize) -> Result<(u32, usize), DecoderError> {
         let start = self.buf.len();
+        if start > u32::MAX as usize {
+            return Err(DecoderError::IntegerOverflow);
+        }
         self.buf.resize(start + max_len, 0);
-        (start as u32, start)
+        Ok((start as u32, start))
     }
 
     /// After Huffman decode, truncate to the actual output length.
@@ -409,7 +413,7 @@ fn huffman_decode_to_arena(
     arena: &mut WriteArena,
 ) -> Result<(u32, u16), DecoderError> {
     let max_out = src.len() * 2;
-    let (start_offset, start_idx) = arena.reserve_mut(max_out);
+    let (start_offset, start_idx) = arena.reserve_mut(max_out)?;
     let actual_len = huffman::decode_to_slice(src, &mut arena.as_mut_slice()[start_idx..])?;
     arena.truncate_to(start_idx + actual_len);
     if actual_len > u16::MAX as usize {
