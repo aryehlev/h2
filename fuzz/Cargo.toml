@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1",  features = ["derive"] }
+bytes = "1"
 libfuzzer-sys = { version = "0.4.0", features = ["arbitrary-derive"] }
 tokio = { version = "1", features = [ "full" ] }
 h2 = { path = "../", features = [ "unstable" ] }
@@ -37,5 +38,11 @@ doc = false
 [[bin]]
 name = "fuzz_e2e"
 path = "fuzz_targets/fuzz_e2e.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_hpack_decode"
+path = "fuzz_targets/fuzz_hpack_decode.rs"
 test = false
 doc = false

@@ -1,7 +1,7 @@
 use super::{util, StreamDependency, StreamId};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
-use crate::hpack::{self, BytesStr, HpackDecode};
+use crate::hpack::{self, BytesStr};
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
@@ -201,6 +201,8 @@ impl Headers {
             stream_id: head.stream_id(),
             stream_dep,
             header_block: HeaderBlock {
+                // Typical HTTP/2 response has ~15-20 headers; 24 avoids
+                // reallocation without significant over-allocation.
                 fields: HeaderMap::with_capacity(24),
                 field_size: 0,
                 is_over_size: false,
@@ -216,7 +218,7 @@ impl Headers {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut impl HpackDecode,
+        decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
     }
@@ -452,6 +454,8 @@ impl PushPromise {
         let frame = PushPromise {
             flags,
             header_block: HeaderBlock {
+                // Typical HTTP/2 response has ~15-20 headers; 24 avoids
+                // reallocation without significant over-allocation.
                 fields: HeaderMap::with_capacity(24),
                 field_size: 0,
                 is_over_size: false,
@@ -467,7 +471,7 @@ impl PushPromise {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut impl HpackDecode,
+        decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
     }
@@ -848,7 +852,7 @@ impl HeaderBlock {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut impl HpackDecode,
+        decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;

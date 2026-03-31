@@ -20,6 +20,17 @@ pub mod fuzz_logic {
         }
     }
 
+    /// Structure-aware decode: test with configurable table size and
+    /// multiple sequential frames to exercise dynamic table state.
+    pub fn fuzz_hpack_decode(table_size: u16, frames: &[&[u8]]) {
+        let mut decoder = hpack::Decoder::new(table_size as usize);
+        for frame in frames {
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(frame);
+            let _ = decoder.decode(&mut Cursor::new(&mut buf), |_h| {});
+        }
+    }
+
     fn encode(e: &mut hpack::Encoder, hdrs: Vec<hpack::Header<Option<HeaderName>>>) -> BytesMut {
         let mut dst = BytesMut::with_capacity(1024);
         e.encode(&mut hdrs.into_iter(), &mut dst);

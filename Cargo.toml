@@ -29,11 +29,6 @@ stream = []
 # depends on this feature.
 unstable = []
 
-# Enables the zero-allocation, SIMD-optimized HPACK decoder.
-# This replaces the default HPACK decode path with an arena-based decoder
-# that eliminates per-header allocations and uses byte-level Huffman tables.
-fast-hpack = []
-
 [workspace]
 members = [
     "tests/h2-fuzz",
@@ -75,7 +70,7 @@ tokio-rustls = "0.26"
 webpki-roots = "1"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(feature, values(\"fast-hpack\"))"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [package.metadata.docs.rs]
 features = ["stream"]

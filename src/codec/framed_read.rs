@@ -26,10 +26,7 @@ pub struct FramedRead<T> {
     inner: InnerFramedRead<T, LengthDelimitedCodec>,
 
     // hpack decoder state
-    #[cfg(not(feature = "fast-hpack"))]
     hpack: hpack::Decoder,
-    #[cfg(feature = "fast-hpack")]
-    hpack: hpack::FastDecoder,
 
     max_header_list_size: usize,
 
@@ -63,10 +60,7 @@ impl<T> FramedRead<T> {
             calc_max_continuation_frames(max_header_list_size, inner.decoder().max_frame_length());
         FramedRead {
             inner,
-            #[cfg(not(feature = "fast-hpack"))]
             hpack: hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
-            #[cfg(feature = "fast-hpack")]
-            hpack: hpack::FastDecoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
             max_header_list_size,
             max_continuation_frames,
             partial: None,
@@ -126,7 +120,7 @@ fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
 ///
 /// This method is intentionally de-generified and outlined because it is very large.
 fn decode_frame(
-    hpack: &mut impl hpack::HpackDecode,
+    hpack: &mut hpack::Decoder,
     max_header_list_size: usize,
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
@@ -446,7 +440,7 @@ impl Continuable {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut impl hpack::HpackDecode,
+        decoder: &mut hpack::Decoder,
     ) -> Result<(), frame::Error> {
         match *self {
             Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
