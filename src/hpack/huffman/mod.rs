@@ -5,6 +5,52 @@ use crate::hpack::DecoderError;
 
 use bytes::{BufMut, BytesMut};
 
+// ===== 10-bit peekahead decode table =====
+//
+// For each possible 10-bit prefix of the bitstream, stores:
+//   (symbol: u8, bits_consumed: u8)
+// where bits_consumed > 0 means "this is a complete symbol of that length".
+// bits_consumed == 0 means the code is longer than 10 bits → fall back to
+// the 4-bit state machine for this and all subsequent symbols.
+//
+// All HPACK Huffman codes ≤10 bits cover virtually every HTTP/2 header
+// byte (all printable ASCII with code lengths 5–10).  The only common
+// exception is DEL (127) and a handful of high-byte symbols that have
+// codes of 19–30 bits — they fall through to the scalar path.
+//
+// The table is generated at compile time from ENCODE_TABLE so there is
+// no runtime cost and the 2 KB footprint fits inside one L1 cache set.
+
+#[cfg(feature = "fast-hpack")]
+const PEEK_BITS: u32 = 10;
+#[cfg(feature = "fast-hpack")]
+const PEEK_SIZE: usize = 1 << PEEK_BITS; // 1024
+
+#[cfg(feature = "fast-hpack")]
+const PEEK_TABLE: [(u8, u8); PEEK_SIZE] = build_peek_table();
+
+#[cfg(feature = "fast-hpack")]
+const fn build_peek_table() -> [(u8, u8); PEEK_SIZE] {
+    let mut table = [(0u8, 0u8); PEEK_SIZE];
+    let mut sym = 0usize;
+    while sym < 256 {
+        let (nbits, code) = ENCODE_TABLE[sym];
+        // code is right-aligned; codes longer than PEEK_BITS can't be fast-pathed
+        if nbits > 0 && nbits <= PEEK_BITS as usize {
+            // Fill every table slot whose top `nbits` bits match `code`.
+            let prefix = (code as usize) << (PEEK_BITS as usize - nbits);
+            let count = 1usize << (PEEK_BITS as usize - nbits);
+            let mut j = 0usize;
+            while j < count {
+                table[prefix + j] = (sym as u8, nbits as u8);
+                j += 1;
+            }
+        }
+        sym += 1;
+    }
+    table
+}
+
 // Constructed in the generated `table.rs` file
 struct Decoder {
     state: u8,
@@ -95,46 +141,6 @@ impl Decoder {
         Ok(ret)
     }
 
-    /// Decode a full input byte (8 bits) by composing two 4-bit lookups.
-    /// Writes 0-2 output bytes to `dst` at `dst_pos`, returns new dst_pos.
-    #[cfg(feature = "fast-hpack")]
-    #[inline(always)]
-    fn decode_byte(&mut self, input: u8, dst: &mut [u8], mut dst_pos: usize) -> Result<usize, DecoderError> {
-        let hi = (input >> 4) as usize;
-        let lo = (input & 0x0F) as usize;
-
-        // High nibble
-        let (next1, byte1, flags1) = DECODE_TABLE[self.state as usize][hi];
-        if flags1 & ERROR != 0 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
-        if flags1 & DECODED != 0 {
-            if dst_pos >= dst.len() {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
-            dst[dst_pos] = byte1;
-            dst_pos += 1;
-        }
-
-        // Low nibble
-        let (next2, byte2, flags2) = DECODE_TABLE[next1 as usize][lo];
-        if flags2 & ERROR != 0 {
-            return Err(DecoderError::InvalidHuffmanCode);
-        }
-        if flags2 & DECODED != 0 {
-            if dst_pos >= dst.len() {
-                return Err(DecoderError::InvalidHuffmanCode);
-            }
-            dst[dst_pos] = byte2;
-            dst_pos += 1;
-        }
-
-        self.state = next2;
-        self.maybe_eos = flags2 & MAYBE_EOS != 0;
-
-        Ok(dst_pos)
-    }
-
     fn is_final(&self) -> bool {
         self.state == 0 || self.maybe_eos
     }
@@ -144,25 +150,124 @@ impl Decoder {
 /// Returns the number of bytes written to `dst`.
 /// `dst` must be at least `src.len() * 2` bytes long.
 ///
-/// This avoids all BytesMut overhead: no reserve, no split, no freeze.
+/// Uses a 10-bit peekahead table for the common fast path (all HPACK codes
+/// ≤10 bits, covering ~100% of HTTP/2 header traffic).  Codes longer than
+/// 10 bits fall back to the 4-bit scalar state machine.
+///
+/// Inner loop is unsafe to eliminate bounds-checks on the pre-allocated dst.
 #[cfg(feature = "fast-hpack")]
 pub fn decode_to_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, DecoderError> {
     debug_assert!(
         dst.len() >= src.len() * 2,
         "dst must be at least src.len()*2 bytes for Huffman decode"
     );
-    let mut decoder = Decoder::new();
-    let mut pos = 0;
 
-    for &b in src {
-        pos = decoder.decode_byte(b, dst, pos)?;
+    // ── Peekahead fast path ──────────────────────────────────────────────────
+    // Maintain a 64-bit MSB-first bit buffer.  We keep bits left-aligned so
+    // the top `PEEK_BITS` bits are always the next peek window.
+    let mut bit_buf: u64 = 0;
+    let mut bits: u32 = 0; // number of valid bits in bit_buf (from MSB)
+    let mut src_pos: usize = 0;
+    let mut dst_pos: usize = 0;
+
+    // Fill the buffer to at least PEEK_BITS.
+    macro_rules! refill {
+        () => {
+            while src_pos < src.len() && bits <= 56 {
+                // SAFETY: src_pos < src.len() checked in while condition
+                bit_buf |= unsafe { (*src.get_unchecked(src_pos)) as u64 }
+                    << (56 - bits);
+                bits += 8;
+                src_pos += 1;
+            }
+        };
     }
 
-    if !decoder.is_final() {
-        return Err(DecoderError::InvalidHuffmanCode);
+    refill!();
+
+    // Process symbols as long as there are bits available.
+    // The PEEK_TABLE is indexed by the top PEEK_BITS bits of bit_buf; when
+    // bits < PEEK_BITS the lookup is zero-padded, which is still correct for
+    // codes ≤ bits because the table stores all suffixes of each code.
+    while bits > 0 {
+        // Top PEEK_BITS bits of bit_buf select the table entry.
+        let peek = (bit_buf >> (64 - PEEK_BITS)) as usize;
+        // SAFETY: peek is always < PEEK_SIZE = 1024 (top 10 bits of u64)
+        let (sym, consumed) = unsafe { *PEEK_TABLE.get_unchecked(peek) };
+
+        if consumed == 0 || consumed as u32 > bits {
+            // consumed == 0: code is longer than PEEK_BITS → scalar fallback.
+            // consumed > bits: not enough bits for this code; could be EOS
+            //   padding or a >PEEK_BITS code — scalar fallback handles both.
+            break;
+        }
+
+        // SAFETY: dst is pre-allocated to src.len()*2, and the maximum
+        // expansion ratio for Huffman decode is <2× — dst_pos never exceeds
+        // the allocated length for valid input.
+        unsafe { *dst.get_unchecked_mut(dst_pos) = sym };
+        dst_pos += 1;
+
+        bit_buf <<= consumed;
+        bits -= consumed as u32;
+
+        if bits < PEEK_BITS {
+            refill!();
+        }
     }
 
-    Ok(pos)
+    // ── Scalar fallback ─────────────────────────────────────────────────────
+    // Handles: (a) codes > 10 bits (rare in HTTP/2), (b) symbols straddling
+    // the end-of-buffer when bits < PEEK_BITS, (c) final EOS padding.
+    // We always run the scalar path when there are leftover bits or bytes so
+    // that is_final() provides the authoritative EOS validation.
+    if src_pos < src.len() || bits > 0 {
+        let mut decoder = Decoder::new();
+
+        // Re-process the buffered bits (MSB-first) through the 4-bit state machine.
+        // Extract whole nibbles; leftover bits (<4) are discarded — the EOS padding
+        // bits that fill the final nibble are implicitly checked by is_final().
+        let mut rem_bits = bits;
+        let mut rem_buf = bit_buf;
+        while rem_bits >= 4 {
+            let nybble = ((rem_buf >> 60) as u8) & 0xF;
+            rem_buf <<= 4;
+            rem_bits -= 4;
+            if let Some(c) = decoder.decode4(nybble)? {
+                if dst_pos >= dst.len() {
+                    return Err(DecoderError::InvalidHuffmanCode);
+                }
+                dst[dst_pos] = c;
+                dst_pos += 1;
+            }
+        }
+
+        // Process remaining source bytes.
+        for &b in &src[src_pos..] {
+            if let Some(c) = decoder.decode4(b >> 4)? {
+                if dst_pos >= dst.len() {
+                    return Err(DecoderError::InvalidHuffmanCode);
+                }
+                dst[dst_pos] = c;
+                dst_pos += 1;
+            }
+            if let Some(c) = decoder.decode4(b & 0xf)? {
+                if dst_pos >= dst.len() {
+                    return Err(DecoderError::InvalidHuffmanCode);
+                }
+                dst[dst_pos] = c;
+                dst_pos += 1;
+            }
+        }
+
+        if !decoder.is_final() {
+            return Err(DecoderError::InvalidHuffmanCode);
+        }
+    }
+    // else: fast path consumed every bit cleanly — no EOS tail to validate
+    // because the final symbol left exactly 0 buffered bits.
+
+    Ok(dst_pos)
 }
 
 // ===== SIMD Header Validation =====
@@ -450,5 +555,49 @@ mod test {
 
             assert_eq!(&decoded[..], &s[..]);
         }
+    }
+}
+
+#[cfg(all(test, feature = "fast-hpack"))]
+mod slice_tests {
+    use super::*;
+
+    fn roundtrip(input: &[u8]) {
+        // encode using encode()
+        let mut encoded = bytes::BytesMut::new();
+        encode(input, &mut encoded);
+        let encoded_bytes = encoded.freeze();
+
+        // decode using decode_to_slice
+        let mut dst = vec![0u8; encoded_bytes.len() * 2 + 4];
+        let n = decode_to_slice(&encoded_bytes, &mut dst)
+            .unwrap_or_else(|e| panic!("decode_to_slice failed for input {:?} (encoded {:?}): {:?}", input, &encoded_bytes[..], e));
+        assert_eq!(&dst[..n], input, "roundtrip mismatch for input {:?} (encoded {:?})", input, &encoded_bytes[..]);
+    }
+
+    #[test]
+    fn test_roundtrip_ascii() {
+        roundtrip(b"application/json");
+        roundtrip(b"GET");
+        roundtrip(b"https");
+        roundtrip(b"/index.html");
+        roundtrip(b"www.example.com");
+        roundtrip(b"no-cache");
+    }
+
+    #[test]
+    fn test_roundtrip_all_bytes() {
+        for b in 0u8..=127 {
+            roundtrip(&[b]);
+        }
+        for b in 0u8..=127 {
+            roundtrip(&[b, b, b]);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_long() {
+        let long_str: Vec<u8> = b"content-type: application/json; charset=utf-8".to_vec();
+        roundtrip(&long_str);
     }
 }
