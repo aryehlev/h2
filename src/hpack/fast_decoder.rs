@@ -151,6 +151,7 @@ impl DecodedHeader {
 }
 
 /// Helper for tracking name source in decode_literal_fast.
+#[derive(Copy, Clone)]
 enum NameSource {
     Static(u8),
     Arena { offset: u32, len: u16 },
@@ -655,6 +656,100 @@ fn match_known_header(name: &[u8]) -> Option<HeaderName> {
     None
 }
 
+// ===== Block Cache =====
+
+const BLOCK_CACHE_SLOTS: usize = 16;
+
+/// Records one dynamic-table insertion made during a literal-with-indexing decode.
+/// Stored as arena offsets/static indices so they can be cheaply turned into `Bytes`
+/// after the arena is frozen.
+enum MutationRecord {
+    /// Name is from the static table (idx ≤ 61); value lives in the arena.
+    StaticName {
+        static_idx: u8,
+        value_offset: u32,
+        value_len: u16,
+    },
+    /// Both name and value live in the arena.
+    ArenaName {
+        name_offset: u32,
+        name_len: u16,
+        value_offset: u32,
+        value_len: u16,
+    },
+}
+
+/// One entry in the per-connection block cache.
+struct CacheEntry {
+    /// FNV-1a hash of the raw encoded header-block bytes.
+    hash: u64,
+    /// Dynamic-table generation counter captured *before* this decode ran.
+    /// Together with `hash` this uniquely identifies the decoded output.
+    table_gen: u64,
+    /// Fully materialized headers, ready to emit without further parsing.
+    headers: Vec<Header>,
+    /// Dynamic-table mutations caused by this decode, in insertion order.
+    /// Must be replayed on every cache hit to keep the table state consistent.
+    mutations: Vec<(Bytes, Bytes)>,
+}
+
+/// Direct-mapped 16-slot cache keyed by `(hash, table_gen)`.
+/// A collision simply evicts the existing entry for that slot (O(1) lookup).
+struct BlockCache {
+    slots: Vec<Option<CacheEntry>>,
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        BlockCache {
+            slots: (0..BLOCK_CACHE_SLOTS).map(|_| None).collect(),
+        }
+    }
+
+    #[inline]
+    fn lookup(&self, hash: u64, table_gen: u64) -> Option<&CacheEntry> {
+        let slot = (hash as usize) & (BLOCK_CACHE_SLOTS - 1);
+        if let Some(entry) = &self.slots[slot] {
+            if entry.hash == hash && entry.table_gen == table_gen {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn insert(
+        &mut self,
+        hash: u64,
+        table_gen: u64,
+        headers: Vec<Header>,
+        mutations: Vec<(Bytes, Bytes)>,
+    ) {
+        let slot = (hash as usize) & (BLOCK_CACHE_SLOTS - 1);
+        self.slots[slot] = Some(CacheEntry {
+            hash,
+            table_gen,
+            headers,
+            mutations,
+        });
+    }
+}
+
+/// FNV-1a hash over a byte slice. Fast enough (~1 byte/cycle) that hashing a
+/// typical 100–200 byte header block adds only ~200 cycles — well below the
+/// cost of a full Huffman decode.
+#[inline(always)]
+fn fnv_hash_bytes(data: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 1099511628211;
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    let mut hash = FNV_OFFSET;
+    for &b in data {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 // ===== FastDecoder =====
 
 /// Zero-allocation HPACK decoder with unsafe fast paths.
@@ -671,6 +766,15 @@ pub struct FastDecoder {
     dyn_table: DynTable,
     /// Reusable decoded header output vec
     decoded_headers: Vec<DecodedHeader>,
+    /// Scratch buffer for recording dynamic-table mutations during a decode.
+    /// Cleared at the start of every `decode()` call.
+    mutation_log: Vec<MutationRecord>,
+    /// Monotonic counter: incremented once per dynamic-table insertion and once
+    /// per dynamic-table size update. Used as part of the block-cache key to
+    /// distinguish table states across requests.
+    block_generation: u64,
+    /// Per-connection cache of recently decoded header blocks.
+    block_cache: BlockCache,
 }
 
 impl FastDecoder {
@@ -681,6 +785,9 @@ impl FastDecoder {
             last_max_update: size,
             dyn_table: DynTable::new(size),
             decoded_headers: Vec::with_capacity(32),
+            mutation_log: Vec::new(),
+            block_generation: 0,
+            block_cache: BlockCache::new(),
         }
     }
 
@@ -709,6 +816,7 @@ impl FastDecoder {
         // then record the final size as the ceiling for encoder size-update signals.
         if let Some(min_size) = self.pending_min_update.take() {
             self.dyn_table.set_max_size(min_size);
+            self.block_generation += 1;
         }
         if let Some(final_size) = self.pending_final_update.take() {
             self.last_max_update = final_size;
@@ -717,9 +825,47 @@ impl FastDecoder {
         let data = &src.chunk()[..src.remaining()];
         let data_len = data.len();
 
-        // Fresh arena per frame
+        // ── Cache lookup ────────────────────────────────────────────────────
+        // Key: (FNV-1a hash of raw bytes, dynamic-table generation before this decode).
+        // When both match, the decoded output is deterministic — emit cached headers
+        // and replay only the cheap table mutations, skipping all Huffman work.
+        let data_hash = fnv_hash_bytes(data);
+        let table_gen = self.block_generation;
+
+        // We only cache blocks without in-block size-update signals.  Those are
+        // rare (only after a SETTINGS exchange) so we track them below and skip
+        // caching when one is encountered.
+        let mut cacheable = true;
+
+        if let Some(entry) = self.block_cache.lookup(data_hash, table_gen) {
+            // Clone mutations and headers out before reborrowing self mutably.
+            let mutations: Vec<(Bytes, Bytes)> = entry.mutations.clone();
+            let headers: Vec<Header> = entry.headers.clone();
+
+            // Replay dynamic-table mutations to keep table state consistent.
+            for (name, value) in &mutations {
+                self.dyn_table.insert_raw(name, value);
+            }
+            self.block_generation += mutations.len() as u64;
+
+            // Emit cached headers — no Huffman decode, no arena, no validation.
+            for header in headers {
+                f(header);
+            }
+
+            // Advance cursor and consume from BytesMut.
+            src.advance(data_len);
+            let cursor_pos = src.position() as usize;
+            let _ = src.get_mut().split_to(cursor_pos);
+            src.set_position(0);
+            return Ok(());
+        }
+
+        // ── Full decode (cache miss) ─────────────────────────────────────────
+        // Fresh arena per frame.
         let mut arena = WriteArena::new();
         self.decoded_headers.clear();
+        self.mutation_log.clear();
 
         let mut pos = 0;
         while pos < data.len() {
@@ -744,6 +890,7 @@ impl FastDecoder {
                     return Err(DecoderError::InvalidMaxDynamicSize);
                 }
                 self.dyn_table.set_max_size(new_size);
+                cacheable = false; // in-block size update — skip caching
             } else {
                 can_resize = false;
                 let decoded =
@@ -752,16 +899,61 @@ impl FastDecoder {
             }
         }
 
-        // Freeze the arena into a single Bytes — one allocation shared by all headers
+        // Freeze the arena into a single Bytes — one allocation shared by all headers.
         let frozen = arena.freeze();
 
-        // Materialize all headers via fast paths
+        // ── Build cache entry ───────────────────────────────────────────────
+        // Convert mutation log (arena offsets) → Bytes slices from the frozen arena.
+        // This is zero-copy: Bytes::from_static for static names, frozen.slice() for arena.
+        let cached_mutations: Vec<(Bytes, Bytes)> = self
+            .mutation_log
+            .drain(..)
+            .map(|m| match m {
+                MutationRecord::StaticName {
+                    static_idx,
+                    value_offset,
+                    value_len,
+                } => {
+                    let name = Bytes::from_static(STATIC_TABLE[static_idx as usize].0);
+                    let value = frozen
+                        .slice(value_offset as usize..value_offset as usize + value_len as usize);
+                    (name, value)
+                }
+                MutationRecord::ArenaName {
+                    name_offset,
+                    name_len,
+                    value_offset,
+                    value_len,
+                } => {
+                    let name = frozen
+                        .slice(name_offset as usize..name_offset as usize + name_len as usize);
+                    let value = frozen
+                        .slice(value_offset as usize..value_offset as usize + value_len as usize);
+                    (name, value)
+                }
+            })
+            .collect();
+
+        self.block_generation += cached_mutations.len() as u64;
+
+        // Materialize all headers via fast paths.
+        let mut cached_headers = Vec::with_capacity(self.decoded_headers.len());
         for decoded in &self.decoded_headers {
-            let header = decoded.materialize(&frozen)?;
+            cached_headers.push(decoded.materialize(&frozen)?);
+        }
+
+        // Store in cache (cheap: Header::clone just bumps Bytes refcounts).
+        if cacheable {
+            self.block_cache
+                .insert(data_hash, table_gen, cached_headers.clone(), cached_mutations);
+        }
+
+        // Emit headers.
+        for header in cached_headers {
             f(header);
         }
 
-        // Advance cursor and consume from BytesMut
+        // Advance cursor and consume from BytesMut.
         src.advance(data_len);
         let cursor_pos = src.position() as usize;
         let _ = src.get_mut().split_to(cursor_pos);
@@ -828,13 +1020,30 @@ impl FastDecoder {
         // Decode value string
         let (value_offset, value_len) = self.decode_string_fast(data, pos, arena)?;
 
-        // Insert into dynamic table if needed
+        // Insert into dynamic table if needed, and record the mutation for caching.
         if index {
             let name_bytes: &[u8] = match name_source {
                 NameSource::Static(idx) => STATIC_TABLE[idx as usize].0,
                 NameSource::Arena { offset, len } => arena.slice_ref(offset, len),
             };
             let value_bytes = arena.slice_ref(value_offset, value_len);
+
+            // Record mutation before inserting so the arena offsets are still valid.
+            let record = match name_source {
+                NameSource::Static(idx) => MutationRecord::StaticName {
+                    static_idx: idx,
+                    value_offset,
+                    value_len,
+                },
+                NameSource::Arena { offset, len } => MutationRecord::ArenaName {
+                    name_offset: offset,
+                    name_len: len,
+                    value_offset,
+                    value_len,
+                },
+            };
+            self.mutation_log.push(record);
+
             self.dyn_table.insert_raw(name_bytes, value_bytes);
         }
 

@@ -20,6 +20,8 @@ edition = "2021"
 rust-version = "1.63"
 
 [features]
+default = ["fast-hpack"]
+
 # Enables `futures::Stream` implementations for various types.
 stream = []
 
