@@ -1,7 +1,7 @@
 use super::{util, StreamDependency, StreamId};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
-use crate::hpack::{self, BytesStr};
+use crate::hpack::{self, BytesStr, HpackDecode};
 
 use http::header::{self, HeaderName, HeaderValue};
 use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
@@ -201,7 +201,7 @@ impl Headers {
             stream_id: head.stream_id(),
             stream_dep,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(24),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -216,7 +216,7 @@ impl Headers {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut hpack::Decoder,
+        decoder: &mut impl HpackDecode,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
     }
@@ -452,7 +452,7 @@ impl PushPromise {
         let frame = PushPromise {
             flags,
             header_block: HeaderBlock {
-                fields: HeaderMap::new(),
+                fields: HeaderMap::with_capacity(24),
                 field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
@@ -467,7 +467,7 @@ impl PushPromise {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut hpack::Decoder,
+        decoder: &mut impl HpackDecode,
     ) -> Result<(), Error> {
         self.header_block.load(src, max_header_list_size, decoder)
     }
@@ -848,7 +848,7 @@ impl HeaderBlock {
         &mut self,
         src: &mut BytesMut,
         max_header_list_size: usize,
-        decoder: &mut hpack::Decoder,
+        decoder: &mut impl HpackDecode,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
         let mut malformed = false;
