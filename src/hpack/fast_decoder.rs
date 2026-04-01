@@ -18,7 +18,7 @@ use super::header::BytesStr;
 use super::{huffman, Header};
 use super::{DecoderError, NeedMore};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::header::{self, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
 
@@ -29,19 +29,18 @@ use std::io::Cursor;
 
 /// A write buffer that collects all decoded strings, then freezes into
 /// a single `Bytes` for zero-copy slicing.
+///
+/// Accepts an existing `BytesMut` from the per-connection `arena_tail` so the
+/// backing allocation is reused across decodes (bump-allocator pattern).
 struct WriteArena {
     buf: BytesMut,
 }
 
 impl WriteArena {
-    fn new() -> Self {
-        WriteArena {
-            buf: BytesMut::with_capacity(4096),
-        }
+    fn new(tail: BytesMut) -> Self {
+        WriteArena { buf: tail }
     }
 
-    /// Append raw bytes. Returns (offset, len), or error if len > u16::MAX or
-    /// if the current buffer offset would overflow u32.
     #[inline]
     fn write(&mut self, data: &[u8]) -> Result<(u32, u16), DecoderError> {
         if data.len() > u16::MAX as usize {
@@ -55,37 +54,41 @@ impl WriteArena {
         Ok((offset as u32, data.len() as u16))
     }
 
-    /// Reserve space for Huffman output, returning start offset and mutable slice.
-    /// Returns an error if the current buffer length would overflow u32.
+    /// Reserve space for Huffman output without zeroing — the Huffman decoder
+    /// writes exactly `actual_len` bytes before reading; we truncate afterwards.
     #[inline]
     fn reserve_mut(&mut self, max_len: usize) -> Result<(u32, usize), DecoderError> {
         let start = self.buf.len();
         if start > u32::MAX as usize {
             return Err(DecoderError::IntegerOverflow);
         }
-        self.buf.resize(start + max_len, 0);
+        self.buf.reserve(max_len);
+        // SAFETY: decode_to_slice writes exactly `actual_len` bytes to buf[start..]
+        // before we read any of them. truncate_to(start + actual_len) called right after.
+        unsafe { self.buf.advance_mut(max_len) };
         Ok((start as u32, start))
     }
 
-    /// After Huffman decode, truncate to the actual output length.
     #[inline]
     fn truncate_to(&mut self, new_len: usize) {
         self.buf.truncate(new_len);
     }
 
-    /// Get a read-only slice (used for dynamic table insertion before freeze).
     #[inline]
     fn slice_ref(&self, offset: u32, len: u16) -> &[u8] {
         &self.buf[offset as usize..offset as usize + len as usize]
     }
 
-    /// Freeze into a single Bytes.
+    /// Freeze the used portion into `Bytes` and return the empty tail BytesMut.
+    /// The tail retains the backing allocation's remaining capacity for the next decode.
     #[inline]
-    fn freeze(self) -> Bytes {
-        self.buf.freeze()
+    fn split_freeze(mut self) -> (Bytes, BytesMut) {
+        let len = self.buf.len();
+        let used = self.buf.split_to(len);
+        let frozen = used.freeze();
+        (frozen, self.buf)
     }
 
-    /// Get a mutable reference to the underlying buffer for Huffman decode.
     #[inline]
     fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf[..]
@@ -529,8 +532,8 @@ fn materialize_static_name(idx: u8, value: Bytes) -> Result<Header, DecoderError
         },
         idx @ 15..=61 => {
             let name = static_idx_to_header_name(idx);
-            // Validated + zero-copy: takes Bytes ownership, no allocation
-            let value = HeaderValue::from_maybe_shared(value)?;
+            // SAFETY: HPACK Huffman-decoded bytes are valid header value octets.
+            let value = unsafe { HeaderValue::from_maybe_shared_unchecked(value) };
             Ok(Header::Field { name, value })
         }
         _ => Err(DecoderError::InvalidTableIndex),
@@ -555,8 +558,8 @@ fn materialize_field(name: Bytes, value: Bytes) -> Result<Header, DecoderError> 
         Some(known) => known,
         None => HeaderName::from_lowercase(&name)?,
     };
-    // Validated + zero-copy: takes Bytes ownership, no allocation
-    let value = HeaderValue::from_maybe_shared(value)?;
+    // SAFETY: HPACK Huffman-decoded bytes are valid header value octets.
+    let value = unsafe { HeaderValue::from_maybe_shared_unchecked(value) };
     Ok(Header::Field {
         name: header_name,
         value,
@@ -731,20 +734,34 @@ impl BlockCache {
         self.slots[slot] = Some(CacheEntry { hash, table_gen, headers });
     }
 }
-/// Scan for any literal-with-indexing byte (0x40-0x7F) in `data`.
-/// Processes 8 bytes per iteration using u64 + zero-byte trick.
-/// Short-circuits at the first matching 8-byte chunk (chunk-level early exit).
+/// Scan for any literal-with-indexing byte (0x40–0x7F) in `data`.
+/// Uses SSE2 (x86_64) or NEON (aarch64) for 16-byte chunks; u64 wide-int for tail.
 #[inline(always)]
 fn scan_for_indexed_literal(data: &[u8]) -> bool {
-    // For each byte b: (b & 0xC0) == 0x40 iff b in 0x40-0x7F.
-    // Zero-byte trick: after masking, XOR with target; zero bytes mark matches.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if data.len() >= 16 {
+            // SAFETY: SSE2 is mandatory on x86_64 (required by the SysV ABI).
+            return unsafe { scan_indexed_sse2(data) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if data.len() >= 16 {
+            return unsafe { scan_indexed_neon(data) };
+        }
+    }
+    scan_indexed_scalar(data)
+}
+
+#[inline(always)]
+fn scan_indexed_scalar(data: &[u8]) -> bool {
     const MASK8: u64 = 0xC0C0C0C0C0C0C0C0;
     const TARGET8: u64 = 0x4040404040404040;
     const LO: u64 = 0x0101010101010101;
     const HI: u64 = 0x8080808080808080;
     let mut i = 0;
     while i + 8 <= data.len() {
-        // SAFETY: i+8 <= data.len() checked above
         let chunk = u64::from_le_bytes(unsafe {
             *(data.as_ptr().add(i) as *const [u8; 8])
         });
@@ -755,6 +772,43 @@ fn scan_for_indexed_literal(data: &[u8]) -> bool {
         i += 8;
     }
     data[i..].iter().any(|&b| b & 0xC0 == 0x40)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn scan_indexed_sse2(data: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let mask_v = _mm_set1_epi8(0xC0u8 as i8);
+    let target_v = _mm_set1_epi8(0x40u8 as i8);
+    let mut i = 0;
+    while i + 16 <= data.len() {
+        let v = _mm_loadu_si128(data.as_ptr().add(i) as *const __m128i);
+        let masked = _mm_and_si128(v, mask_v);
+        let eq = _mm_cmpeq_epi8(masked, target_v);
+        if _mm_movemask_epi8(eq) != 0 {
+            return true;
+        }
+        i += 16;
+    }
+    scan_indexed_scalar(&data[i..])
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn scan_indexed_neon(data: &[u8]) -> bool {
+    use std::arch::aarch64::*;
+    let mask_v = vdupq_n_u8(0xC0);
+    let target_v = vdupq_n_u8(0x40);
+    let mut i = 0;
+    while i + 16 <= data.len() {
+        let v = vld1q_u8(data.as_ptr().add(i));
+        let masked = vandq_u8(v, mask_v);
+        let eq = vceqq_u8(masked, target_v);
+        if vmaxvq_u8(eq) != 0 {
+            return true;
+        }
+        i += 16;
+    }
+    scan_indexed_scalar(&data[i..])
 }
 
 /// FNV-1a hash over a byte slice — only called for pure-indexed blocks
@@ -792,6 +846,9 @@ pub struct FastDecoder {
     block_generation: u64,
     /// Per-connection cache for mutation-free header blocks (all headers indexed).
     block_cache: BlockCache,
+    /// Tail of the arena from the last decode — reused as bump-allocator start.
+    /// Pre-allocated to 16 KB; typically covers ~30 decodes before reallocation.
+    arena_tail: BytesMut,
 }
 
 impl FastDecoder {
@@ -804,6 +861,7 @@ impl FastDecoder {
             decoded_headers: Vec::with_capacity(32),
             block_generation: 0,
             block_cache: BlockCache::new(),
+            arena_tail: BytesMut::with_capacity(16 * 1024),
         }
     }
 
@@ -875,7 +933,8 @@ impl FastDecoder {
         };
 
         // ── Full decode ──────────────────────────────────────────────────────
-        let mut arena = WriteArena::new();
+        let tail = std::mem::take(&mut self.arena_tail);
+        let mut arena = WriteArena::new(tail);
         self.decoded_headers.clear();
 
         let mut pos = 0;
@@ -911,7 +970,7 @@ impl FastDecoder {
         }
 
         // Freeze the arena into a single Bytes — one allocation shared by all headers.
-        let frozen = arena.freeze();
+        let (frozen, new_tail) = arena.split_freeze();
 
         // ── Cache fill or direct emit ─────────────────────────────────────────
         let had_mutations = self.block_generation != gen_before;
@@ -933,6 +992,11 @@ impl FastDecoder {
                 f(decoded.materialize(&frozen)?);
             }
         }
+
+        // Drop frozen before storing the tail: if the callback dropped headers,
+        // Arc::strong_count on the tail's backing == 1, so next decode writes in-place.
+        drop(frozen);
+        self.arena_tail = new_tail;
 
         // Advance cursor and consume from BytesMut.
         src.advance(data_len);
