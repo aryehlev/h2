@@ -181,7 +181,7 @@ struct DynTable {
 impl DynTable {
     fn new(max_size: usize) -> Self {
         DynTable {
-            storage: Vec::with_capacity(max_size.min(16384)),
+            storage: Vec::with_capacity(max_size.min(16384) * 2),
             storage_pos: 0,
             entries: VecDeque::with_capacity(64),
             size: 0,
@@ -279,6 +279,12 @@ impl DynTable {
         // of still-live data in storage.
         let base = self.entries.back().unwrap().name_start as usize;
         if base == 0 {
+            return;
+        }
+        // Amortized: only compact when the buffer is more than half full.
+        // With 2× pre-allocation this runs ~once per max_size bytes of insertions
+        // instead of once per insert, reducing memmove overhead ~13×.
+        if self.storage_pos * 2 < self.storage.capacity() {
             return;
         }
         self.storage.copy_within(base..self.storage_pos, 0);
@@ -596,16 +602,27 @@ fn match_known_header(name: &[u8]) -> Option<HeaderName> {
             if name == b"if-range" { return Some(header::IF_RANGE); }
             if name == b"location" { return Some(header::LOCATION); }
         }
+        9 => {
+            if name == b"x-real-ip" { return Some(HeaderName::from_static("x-real-ip")); }
+            if name == b"x-api-key" { return Some(HeaderName::from_static("x-api-key")); }
+        }
         10 => {
             if name == b"set-cookie" { return Some(header::SET_COOKIE); }
             if name == b"user-agent" { return Some(header::USER_AGENT); }
+            if name == b"x-trace-id" { return Some(HeaderName::from_static("x-trace-id")); }
         }
         11 => {
             if name == b"retry-after" { return Some(header::RETRY_AFTER); }
+            if name == b"grpc-status" { return Some(HeaderName::from_static("grpc-status")); }
+            if name == b"x-b3-spanid" { return Some(HeaderName::from_static("x-b3-spanid")); }
         }
         12 => {
             if name == b"content-type" { return Some(header::CONTENT_TYPE); }
             if name == b"max-forwards" { return Some(header::MAX_FORWARDS); }
+            if name == b"x-request-id" { return Some(HeaderName::from_static("x-request-id")); }
+            if name == b"grpc-message" { return Some(HeaderName::from_static("grpc-message")); }
+            if name == b"x-b3-traceid" { return Some(HeaderName::from_static("x-b3-traceid")); }
+            if name == b"x-auth-token" { return Some(HeaderName::from_static("x-auth-token")); }
         }
         13 => {
             if name == b"accept-ranges" { return Some(header::ACCEPT_RANGES); }
@@ -614,6 +631,7 @@ fn match_known_header(name: &[u8]) -> Option<HeaderName> {
             if name == b"content-range" { return Some(header::CONTENT_RANGE); }
             if name == b"if-none-match" { return Some(header::IF_NONE_MATCH); }
             if name == b"last-modified" { return Some(header::LAST_MODIFIED); }
+            if name == b"grpc-encoding" { return Some(HeaderName::from_static("grpc-encoding")); }
         }
         14 => {
             if name == b"accept-charset" { return Some(header::ACCEPT_CHARSET); }
@@ -622,16 +640,22 @@ fn match_known_header(name: &[u8]) -> Option<HeaderName> {
         15 => {
             if name == b"accept-encoding" { return Some(header::ACCEPT_ENCODING); }
             if name == b"accept-language" { return Some(header::ACCEPT_LANGUAGE); }
+            if name == b"x-forwarded-for" { return Some(HeaderName::from_static("x-forwarded-for")); }
+            if name == b"x-amzn-trace-id" { return Some(HeaderName::from_static("x-amzn-trace-id")); }
         }
         16 => {
             if name == b"content-encoding" { return Some(header::CONTENT_ENCODING); }
             if name == b"content-language" { return Some(header::CONTENT_LANGUAGE); }
             if name == b"content-location" { return Some(header::CONTENT_LOCATION); }
             if name == b"www-authenticate" { return Some(header::WWW_AUTHENTICATE); }
+            if name == b"x-forwarded-host" { return Some(HeaderName::from_static("x-forwarded-host")); }
+            if name == b"x-correlation-id" { return Some(HeaderName::from_static("x-correlation-id")); }
         }
         17 => {
             if name == b"if-modified-since" { return Some(header::IF_MODIFIED_SINCE); }
             if name == b"transfer-encoding" { return Some(header::TRANSFER_ENCODING); }
+            if name == b"x-forwarded-proto" { return Some(HeaderName::from_static("x-forwarded-proto")); }
+            if name == b"x-openrtb-version" { return Some(HeaderName::from_static("x-openrtb-version")); }
         }
         18 => {
             if name == b"proxy-authenticate" { return Some(header::PROXY_AUTHENTICATE); }
@@ -707,9 +731,34 @@ impl BlockCache {
         self.slots[slot] = Some(CacheEntry { hash, table_gen, headers });
     }
 }
-/// FNV-1a hash over a byte slice. Fast enough (~1 byte/cycle) that hashing a
-/// typical 100–200 byte header block adds only ~200 cycles — well below the
-/// cost of a full Huffman decode.
+/// Scan for any literal-with-indexing byte (0x40-0x7F) in `data`.
+/// Processes 8 bytes per iteration using u64 + zero-byte trick.
+/// Short-circuits at the first matching 8-byte chunk (chunk-level early exit).
+#[inline(always)]
+fn scan_for_indexed_literal(data: &[u8]) -> bool {
+    // For each byte b: (b & 0xC0) == 0x40 iff b in 0x40-0x7F.
+    // Zero-byte trick: after masking, XOR with target; zero bytes mark matches.
+    const MASK8: u64 = 0xC0C0C0C0C0C0C0C0;
+    const TARGET8: u64 = 0x4040404040404040;
+    const LO: u64 = 0x0101010101010101;
+    const HI: u64 = 0x8080808080808080;
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        // SAFETY: i+8 <= data.len() checked above
+        let chunk = u64::from_le_bytes(unsafe {
+            *(data.as_ptr().add(i) as *const [u8; 8])
+        });
+        let xored = (chunk & MASK8) ^ TARGET8;
+        if xored.wrapping_sub(LO) & !xored & HI != 0 {
+            return true;
+        }
+        i += 8;
+    }
+    data[i..].iter().any(|&b| b & 0xC0 == 0x40)
+}
+
+/// FNV-1a hash over a byte slice — only called for pure-indexed blocks
+/// (no literal-with-indexing headers) where the result is used as a cache key.
 #[inline(always)]
 fn fnv_hash_bytes(data: &[u8]) -> u64 {
     const FNV_PRIME: u64 = 1099511628211;
@@ -800,9 +849,10 @@ impl FastDecoder {
         // ZERO extra overhead (no hashing, no Vec allocs).
         let gen_before = self.block_generation;
 
-        // Scan raw bytes for any literal-with-indexing byte (0x40-0x7F) BEFORE
-        // hashing to decide whether the cache is worth consulting.
-        let has_indexed_literal = data.iter().any(|&b| b & 0xC0 == 0x40);
+        // Scan raw bytes for any literal-with-indexing byte (0x40-0x7F).
+        // Uses u64 chunks + zero-byte trick: 8× fewer iterations than byte-by-byte,
+        // with chunk-level early exit (returns after the first matching chunk).
+        let has_indexed_literal = scan_for_indexed_literal(data);
 
         let (data_hash, table_gen) = if !has_indexed_literal {
             let h = fnv_hash_bytes(data);
