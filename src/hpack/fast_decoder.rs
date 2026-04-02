@@ -453,7 +453,11 @@ fn materialize_static_full(idx: u8) -> Header {
         12 => Header::Status(StatusCode::BAD_REQUEST),
         13 => Header::Status(StatusCode::NOT_FOUND),
         14 => Header::Status(StatusCode::INTERNAL_SERVER_ERROR),
-        idx @ 15..=61 => Header::Field {
+        16 => Header::Field {
+            name: header::ACCEPT_ENCODING,
+            value: HeaderValue::from_static("gzip, deflate"),
+        },
+        idx @ 15 | idx @ 17..=61 => Header::Field {
             name: static_idx_to_header_name(idx),
             value: HeaderValue::from_static(""),
         },

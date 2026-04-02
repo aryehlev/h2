@@ -224,15 +224,34 @@ pub fn decode_to_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, DecoderError
     if src_pos < src.len() || bits > 0 {
         let mut decoder = Decoder::new();
 
-        // Re-process the buffered bits (MSB-first) through the 4-bit state machine.
-        // Extract whole nibbles; leftover bits (<4) are discarded — the EOS padding
-        // bits that fill the final nibble are implicitly checked by is_final().
-        let mut rem_bits = bits;
+        // Unified bit buffer: start with whatever the fast path left behind,
+        // then refill byte-by-byte from the remaining source as needed.
+        // Processing everything through a single nibble loop ensures no bits
+        // are silently dropped when `bits % 4 != 0` (e.g. after decoding a
+        // symbol whose code length is not a multiple of 4).
         let mut rem_buf = bit_buf;
-        while rem_bits >= 4 {
+        let mut rem_bits = bits;
+        let mut byte_idx = src_pos;
+
+        loop {
+            // Refill from source bytes until we have at least 4 bits.
+            // This ensures leftover bits (rem_bits % 4 != 0) are combined
+            // with the next source byte rather than silently dropped.
+            while rem_bits < 4 && byte_idx < src.len() {
+                rem_buf |= (src[byte_idx] as u64) << (56 - rem_bits);
+                rem_bits += 8;
+                byte_idx += 1;
+            }
+
+            if rem_bits < 4 {
+                // 0–3 bits remain with no more source data.
+                break;
+            }
+
             let nybble = ((rem_buf >> 60) as u8) & 0xF;
             rem_buf <<= 4;
             rem_bits -= 4;
+
             if let Some(c) = decoder.decode4(nybble)? {
                 if dst_pos >= dst.len() {
                     return Err(DecoderError::InvalidHuffmanCode);
@@ -242,21 +261,31 @@ pub fn decode_to_slice(src: &[u8], dst: &mut [u8]) -> Result<usize, DecoderError
             }
         }
 
-        // Process remaining source bytes.
-        for &b in &src[src_pos..] {
-            if let Some(c) = decoder.decode4(b >> 4)? {
-                if dst_pos >= dst.len() {
-                    return Err(DecoderError::InvalidHuffmanCode);
+        // Handle the final 0–3 remaining bits.
+        //
+        // HPACK mandates EOS padding = a prefix of the EOS symbol = all 1-bits.
+        // If the remaining bits contain any 0, they are DATA (part of the last
+        // symbol) and must be decoded regardless of is_final().  Only when all
+        // remaining bits are 1s can they be genuine EOS padding; in that case
+        // we check is_final() and skip them if the stream is already valid.
+        if rem_bits > 0 {
+            // Extract the rem_bits significant bits (right-aligned) from rem_buf.
+            let remaining_top = rem_buf >> (64 - rem_bits);
+            let all_ones_mask = (1u64 << rem_bits) - 1;
+            let is_eos_padding = remaining_top == all_ones_mask;
+
+            if !is_eos_padding || !decoder.is_final() {
+                // Either data bits (any 0 present) or decoder not yet final.
+                // Pad with 1s to form a complete nibble and feed to the decoder.
+                let shift = 4 - rem_bits;
+                let nybble = (((rem_buf >> 60) as u8) & 0xF) | ((1u8 << shift) - 1);
+                if let Some(c) = decoder.decode4(nybble)? {
+                    if dst_pos >= dst.len() {
+                        return Err(DecoderError::InvalidHuffmanCode);
+                    }
+                    dst[dst_pos] = c;
+                    dst_pos += 1;
                 }
-                dst[dst_pos] = c;
-                dst_pos += 1;
-            }
-            if let Some(c) = decoder.decode4(b & 0xf)? {
-                if dst_pos >= dst.len() {
-                    return Err(DecoderError::InvalidHuffmanCode);
-                }
-                dst[dst_pos] = c;
-                dst_pos += 1;
             }
         }
 
@@ -599,5 +628,38 @@ mod slice_tests {
     fn test_roundtrip_long() {
         let long_str: Vec<u8> = b"content-type: application/json; charset=utf-8".to_vec();
         roundtrip(&long_str);
+    }
+
+    #[test]
+    fn test_roundtrip_plus_sign() {
+        // '+' has an 11-bit Huffman code (> PEEK_BITS=10), triggering the
+        // scalar fallback.  The leftover bits after fast-path decoding must
+        // be properly carried into the scalar path — not silently dropped.
+        roundtrip(b"+");
+        roundtrip(b"+xml");
+        roundtrip(b"xhtml+xml");
+        roundtrip(b"application/xhtml+xml");
+        roundtrip(b"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    }
+
+    #[test]
+    fn test_roundtrip_mixed_bit_lengths() {
+        // Mix of 5-bit ('t'), 7-bit ('x') and 11-bit ('+') codes exercises
+        // all transitions between fast-path and scalar fallback.
+        roundtrip(b"text/html,application/xhtml");
+        roundtrip(b"text/html,application/xhtml+");
+        roundtrip(b"text/html,application/xhtml+xml");
+        roundtrip(b"text/html,application/xhtml+xml,application/xml");
+    }
+
+    #[test]
+    fn test_roundtrip_cookie() {
+        // This cookie string contains chars with >10-bit Huffman codes
+        // (#=12bits, $=13bits, '=11bits, +=11bits, ]=13bits, ^=14bits)
+        // which trigger the scalar fallback path. The last character 'y'
+        // must not be dropped.
+        roundtrip(b"anj=Kfu=8fG68%Cxrx)0s]#%2L_'x%SEV/hnJPh4FQV_eKj?9AMF4:V)4hY/82QjU'-Rw1Ra^uI$+VZ; path=/; expires=Fri, 01-Feb-2013 13:29:47 GMT; domain=.adnxs.com; HttpOnly");
+        roundtrip(b"HttpOnly");
+        roundtrip(b"domain=.adnxs.com; HttpOnly");
     }
 }
