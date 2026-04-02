@@ -190,11 +190,9 @@ impl Decoder {
         }
 
         #[cfg(not(feature = "fast-hpack"))]
-        {
-            let span = tracing::trace_span!("hpack::decode");
-            let _e = span.enter();
-            tracing::trace!("decode");
-        }
+        let _decode_span = tracing::trace_span!("hpack::decode").entered();
+        #[cfg(not(feature = "fast-hpack"))]
+        tracing::trace!("decode");
 
         while let Some(ty) = peek_u8(src) {
             // At this point we are always at the beginning of the next block

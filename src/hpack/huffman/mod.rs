@@ -377,7 +377,7 @@ pub fn validate_header_name(data: &[u8]) -> bool {
 #[cfg(feature = "fast-hpack")]
 fn validate_header_name_scalar(data: &[u8]) -> bool {
     data.iter()
-        .all(|&b| b >= 0x21 && b != 0x7F && !(b >= 0x41 && b <= 0x5A))
+        .all(|&b| b >= 0x21 && b <= 0x7E && !(b >= 0x41 && b <= 0x5A))
 }
 
 #[cfg(all(feature = "fast-hpack", target_arch = "aarch64"))]
@@ -400,7 +400,10 @@ unsafe fn validate_header_name_neon(data: &[u8]) -> bool {
         let is_ctl = vcltq_u8(v, min_val);
         // Reject DEL
         let is_del = vceqq_u8(v, del_val);
-        let bad = vorrq_u8(vorrq_u8(is_upper, is_ctl), is_del);
+        // Reject high bytes (>= 0x80)
+        let high_val = vdupq_n_u8(0x80);
+        let is_high = vcgeq_u8(v, high_val);
+        let bad = vorrq_u8(vorrq_u8(vorrq_u8(is_upper, is_ctl), is_del), is_high);
         if vmaxvq_u8(bad) != 0 {
             return false;
         }
@@ -479,8 +482,10 @@ unsafe fn validate_header_name_sse2(data: &[u8]) -> bool {
 
         // Reject DEL
         let is_del = _mm_cmpeq_epi8(v, del_val);
+        // Reject high bytes (>= 0x80): after XOR bias, these map to [0x00,0x7F] (non-negative i8)
+        let is_high = _mm_cmpgt_epi8(v_biased, _mm_set1_epi8(-1i8));
 
-        let bad = _mm_or_si128(_mm_or_si128(is_ctl, is_upper), is_del);
+        let bad = _mm_or_si128(_mm_or_si128(_mm_or_si128(is_ctl, is_upper), is_del), is_high);
         if _mm_movemask_epi8(bad) != 0 {
             return false;
         }

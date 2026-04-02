@@ -406,7 +406,10 @@ fn decode_int_slow(src: &[u8], pos: &mut usize, mut ret: usize) -> Result<usize,
         }
         let b = src[*pos];
         *pos += 1;
-        ret += ((b & 0x7F) as usize) << shift;
+        let val = ((b & 0x7F) as usize)
+            .checked_shl(shift)
+            .ok_or(DecoderError::IntegerOverflow)?;
+        ret = ret.checked_add(val).ok_or(DecoderError::IntegerOverflow)?;
         shift += 7;
         if b & 0x80 == 0 {
             return Ok(ret);
@@ -536,7 +539,9 @@ fn materialize_static_name(idx: u8, value: Bytes) -> Result<Header, DecoderError
         },
         idx @ 15..=61 => {
             let name = static_idx_to_header_name(idx);
-            // SAFETY: HPACK Huffman-decoded bytes are valid header value octets.
+            // SAFETY: We skip header value validation for performance. Huffman-decoded
+            // bytes are inherently valid; raw (non-Huffman) strings trust peer compliance.
+            // Invalid bytes from a malicious peer will be accepted when fast-hpack is on.
             let value = unsafe { HeaderValue::from_maybe_shared_unchecked(value) };
             Ok(Header::Field { name, value })
         }
@@ -562,7 +567,9 @@ fn materialize_field(name: Bytes, value: Bytes) -> Result<Header, DecoderError> 
         Some(known) => known,
         None => HeaderName::from_lowercase(&name)?,
     };
-    // SAFETY: HPACK Huffman-decoded bytes are valid header value octets.
+    // SAFETY: We skip header value validation for performance. Huffman-decoded
+    // bytes are inherently valid; raw (non-Huffman) strings trust peer compliance.
+    // Invalid bytes from a malicious peer will be accepted when fast-hpack is on.
     let value = unsafe { HeaderValue::from_maybe_shared_unchecked(value) };
     Ok(Header::Field {
         name: header_name,
