@@ -1,4 +1,6 @@
 use crate::hpack::{Decoder, Encoder, Header};
+#[cfg(feature = "fast-hpack")]
+use crate::hpack::FastDecoder;
 
 use bytes::BytesMut;
 use hex::FromHex;
@@ -82,6 +84,28 @@ fn test_story(story: Value) {
                 .unwrap();
 
             assert_eq!(0, expect.len());
+        }
+
+        // Second pass: also verify with FastDecoder when feature is enabled
+        #[cfg(feature = "fast-hpack")]
+        {
+            let mut fast_decoder = FastDecoder::default();
+            for case in &cases {
+                let mut expect = case.expect.clone();
+                if let Some(size) = case.header_table_size {
+                    fast_decoder.queue_size_update(size);
+                }
+                let mut buf = BytesMut::with_capacity(case.wire.len());
+                buf.extend_from_slice(&case.wire);
+                fast_decoder
+                    .decode(&mut Cursor::new(&mut buf), |e| {
+                        let (name, value) = expect.remove(0);
+                        assert_eq!(name, key_str(&e), "FastDecoder name mismatch");
+                        assert_eq!(value, value_str(&e), "FastDecoder value mismatch");
+                    })
+                    .expect("FastDecoder full decode");
+                assert_eq!(0, expect.len(), "FastDecoder header count mismatch");
+            }
         }
 
         let mut encoder = Encoder::default();

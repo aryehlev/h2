@@ -189,9 +189,9 @@ impl Decoder {
             self.last_max_update = size;
         }
 
-        let span = tracing::trace_span!("hpack::decode");
-        let _e = span.enter();
-
+        #[cfg(not(feature = "fast-hpack"))]
+        let _decode_span = tracing::trace_span!("hpack::decode").entered();
+        #[cfg(not(feature = "fast-hpack"))]
         tracing::trace!("decode");
 
         while let Some(ty) = peek_u8(src) {
@@ -200,6 +200,7 @@ impl Decoder {
             // determined from the first byte.
             match Representation::load(ty)? {
                 Indexed => {
+                    #[cfg(not(feature = "fast-hpack"))]
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
                     can_resize = false;
                     let entry = self.decode_indexed(src)?;
@@ -207,6 +208,7 @@ impl Decoder {
                     f(entry);
                 }
                 LiteralWithIndexing => {
+                    #[cfg(not(feature = "fast-hpack"))]
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
                     can_resize = false;
                     let entry = self.decode_literal(src, true)?;
@@ -218,6 +220,7 @@ impl Decoder {
                     f(entry);
                 }
                 LiteralWithoutIndexing => {
+                    #[cfg(not(feature = "fast-hpack"))]
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
                     can_resize = false;
                     let entry = self.decode_literal(src, false)?;
@@ -225,6 +228,7 @@ impl Decoder {
                     f(entry);
                 }
                 LiteralNeverIndexed => {
+                    #[cfg(not(feature = "fast-hpack"))]
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
                     can_resize = false;
                     let entry = self.decode_literal(src, false)?;
@@ -235,6 +239,7 @@ impl Decoder {
                     f(entry);
                 }
                 SizeUpdate => {
+                    #[cfg(not(feature = "fast-hpack"))]
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
                     if !can_resize {
                         return Err(DecoderError::InvalidMaxDynamicSize);
@@ -257,6 +262,7 @@ impl Decoder {
             return Err(DecoderError::InvalidMaxDynamicSize);
         }
 
+        #[cfg(not(feature = "fast-hpack"))]
         tracing::debug!(
             from = self.table.size(),
             to = new_size,
@@ -318,6 +324,7 @@ impl Decoder {
         let len = decode_int(buf, 7)?;
 
         if len > buf.remaining() {
+            #[cfg(not(feature = "fast-hpack"))]
             tracing::trace!(len, remaining = buf.remaining(), "decode_string underflow",);
             return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
         }

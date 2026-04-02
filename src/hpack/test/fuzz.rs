@@ -1,4 +1,6 @@
 use crate::hpack::{Decoder, Encoder, Header};
+#[cfg(feature = "fast-hpack")]
+use crate::hpack::FastDecoder;
 
 use http::header::{HeaderName, HeaderValue};
 
@@ -129,11 +131,14 @@ impl FuzzHpack {
 
         let mut encoder = Encoder::default();
         let mut decoder = Decoder::default();
+        #[cfg(feature = "fast-hpack")]
+        let mut fast_decoder = FastDecoder::default();
 
         for frame in frames {
             // build "expected" frames, such that decoding headers always
             // includes a name
             let mut prev_name = None;
+            let mut frame_expect: Vec<Header> = vec![];
             for header in &frame.headers {
                 match header.clone().reify() {
                     Ok(h) => {
@@ -141,13 +146,16 @@ impl FuzzHpack {
                             Header::Field { ref name, .. } => Some(name.clone()),
                             _ => None,
                         };
+                        frame_expect.push(h.clone());
                         expect.push(h);
                     }
                     Err(value) => {
-                        expect.push(Header::Field {
+                        let h = Header::Field {
                             name: prev_name.as_ref().cloned().expect("previous header name"),
                             value,
-                        });
+                        };
+                        frame_expect.push(h.clone());
+                        expect.push(h);
                     }
                 }
             }
@@ -156,6 +164,8 @@ impl FuzzHpack {
 
             if let Some(max) = frame.resizes.iter().max() {
                 decoder.queue_size_update(*max);
+                #[cfg(feature = "fast-hpack")]
+                fast_decoder.queue_size_update(*max);
             }
 
             // Apply resizes
@@ -165,6 +175,9 @@ impl FuzzHpack {
 
             encoder.encode(frame.headers, &mut buf);
 
+            #[cfg(feature = "fast-hpack")]
+            let buf_copy = buf.clone();
+
             // Decode the chunk!
             decoder
                 .decode(&mut Cursor::new(&mut buf), |h| {
@@ -172,6 +185,28 @@ impl FuzzHpack {
                     assert_eq!(h, e);
                 })
                 .expect("full decode");
+
+            // Cross-validate with FastDecoder
+            #[cfg(feature = "fast-hpack")]
+            {
+                let mut buf2 = buf_copy;
+                let mut fast_idx = 0;
+                fast_decoder
+                    .decode(&mut Cursor::new(&mut buf2), |h| {
+                        assert_eq!(
+                            h, frame_expect[fast_idx],
+                            "FastDecoder mismatch at header {}",
+                            fast_idx
+                        );
+                        fast_idx += 1;
+                    })
+                    .expect("FastDecoder full decode");
+                assert_eq!(
+                    fast_idx,
+                    frame_expect.len(),
+                    "FastDecoder header count mismatch"
+                );
+            }
         }
 
         assert_eq!(0, expect.len());
